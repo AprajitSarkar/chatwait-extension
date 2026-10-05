@@ -5,9 +5,28 @@ import type { PromptAdapter, PromptCallbacks } from './types';
 // "wm-app" composer/thread UI with none of these hooks — CSS module class names there are
 // build-hashed (e.g. `_wdUoQG_userMessage`) and unusable as selectors, but it exposes its own
 // stable `data-*` attributes, so both surfaces are matched in parallel rather than picking one.
-const SEND_BTN  = '[data-testid="send-button"], button[data-composer-submit]';
-const COMPOSER  = '#prompt-textarea, [data-mobile-composer-prompt]';
+//
+// Re-verified 2026-10-05 on signed-in chatgpt.com: the classic composer was redesigned onto the
+// same bubble surface (no `#prompt-textarea`, no `data-testid="send-button"`, no
+// `data-message-author-role`). The composer is a contenteditable `[data-composer-markdown]`; Send is
+// `button[type=submit][aria-label="Send"]` and exists only while the composer has text; while
+// generating it is replaced by `button[aria-label="Stop"]`, and once done the composer is empty so
+// Send does NOT come back. Done is therefore "Stop was seen, then gone" (see watchForDone).
+const SEND_BTN  = '[data-testid="send-button"], button[data-composer-submit], form button[type="submit"][aria-label="Send"]';
+const COMPOSER  = '#prompt-textarea, [data-mobile-composer-prompt], [data-composer-markdown]';
 export const USER_MSG  = '[data-message-author-role="user"], [data-user-message-bubble]';
+
+// Redesigned thread: the bubble sits in a column-flex wrapper that shrink-wraps anything placed
+// beside it. The turn container (parent of the search-unit div) is a `display: contents` node whose
+// next sibling is the assistant reply, so inserting after it gives a full-width row between the two.
+function anchorFor(el: HTMLElement): HTMLElement {
+  return el.closest<HTMLElement>('[data-chatgpt-search-unit-key]')?.parentElement ?? el;
+}
+
+function stopButton(): Element | null {
+  const form = document.querySelector(COMPOSER)?.closest('form');
+  return form?.querySelector('button[aria-label="Stop"], button[data-testid="stop-button"]') ?? null;
+}
 
 // Long/old threads get virtualized: ChatGPT unmounts older user messages from the DOM as new
 // ones are appended, so a raw count of matches can legitimately go up, down, or stay flat
@@ -26,7 +45,12 @@ function lastOf(list: NodeListOf<HTMLElement>): HTMLElement | null {
 function lastMsgKey(list: NodeListOf<HTMLElement>): string | HTMLElement | null {
   const el = lastOf(list);
   if (!el) return null;
-  return el.getAttribute('data-message-id') ?? el.closest('li[id]')?.id ?? el;
+  return (
+    el.getAttribute('data-message-id') ??
+    el.closest('li[id]')?.id ??
+    (el.closest('[data-chatgpt-search-message-ids]')?.getAttribute('data-chatgpt-search-message-ids') || null) ??
+    el
+  );
 }
 
 export class ChatGPTAdapter implements PromptAdapter {
@@ -118,7 +142,7 @@ export class ChatGPTAdapter implements PromptAdapter {
       const newEl = lastOf(all);
       if (!newEl || lastMsgKey(all) === this.preSubmitUserMsgKey) return;
       this.anchorObserver?.disconnect();
-      this.cb?.onAnchorReady(newEl);
+      this.cb?.onAnchorReady(anchorFor(newEl));
       this.watchForDone();
     });
     this.anchorObserver.observe(document.body, { childList: true, subtree: true });
@@ -134,7 +158,19 @@ export class ChatGPTAdapter implements PromptAdapter {
     // button's two states regardless of which one is currently live, so comparing against those
     // works for wm-app without a hardcoded string, and is skipped entirely on the classic app,
     // which doesn't have the attributes.
+    // Redesigned app: Send is swapped for a Stop button and does not return (empty composer), so
+    // track Stop explicitly. The send-button path below stays for the other surfaces.
+    let stopSeen = false;
     this.doneObserver = new MutationObserver(() => {
+      if (stopButton()) {
+        stopSeen = true;
+        return;
+      }
+      if (stopSeen) {
+        this.cb?.onDone();
+        this.doneObserver?.disconnect();
+        return;
+      }
       const btn = document.querySelector<HTMLButtonElement>(SEND_BTN);
       if (!btn) return;
       const sendLabel = btn.getAttribute('data-send-label');
